@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""                             # API Key（填 DeepSeek 的 Key，步骤 2 才需要）
     openai_base_url: str = "https://api.deepseek.com/v1"  # DeepSeek 接口地址
     model_name: str = "deepseek-chat"                    # 模型：deepseek-chat（通用）/ deepseek-reasoner（推理）
+    input_price_per_million: float = 1.0    # 输入单价（元/百万 token），DeepSeek 参考价，请以官方为准
+    output_price_per_million: float = 2.0   # 输出单价（元/百万 token），DeepSeek 参考价，请以官方为准
 
     # ---- Agent 行为配置 ----
     max_iterations: int = 10   # 最大循环次数，防止 Agent 陷入死循环
