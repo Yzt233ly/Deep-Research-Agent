@@ -1,0 +1,30 @@
+# ============================================================
+# Deep Research Agent 依赖清单
+#
+# 安装方式（在项目根目录、激活 .venv 后执行）：
+#     pip install -r requirements.txt
+#
+# 说明：这里不写死版本号，让 pip 自动安装彼此兼容的最新版，
+#       对新手更省心；等以后需要"可复现"再锁版本（用 pip freeze）。
+# ============================================================
+
+# --- 步骤 1：配置管理 ---
+# pydantic-settings：读取 .env 文件，把环境变量映射成配置类字段
+# python-dotenv：底层负责解析 .env 文件
+pydantic
+pydantic-settings
+python-dotenv
+
+# --- 步骤 2：LLM 调用与重试 ---
+# langchain：统一的 LLM 应用开发框架（Prompt、ChatModel、结构化输出等）
+# langchain-openai：OpenAI 兼容接口的封装（DeepSeek/通义等也走这个）
+# tenacity：给函数加"失败自动重试"的库
+langchain
+langchain-openai
+tenacity
+
+# --- 步骤 5：网页抓取（后面步骤会用到，先一起装好）---
+# requests：发 HTTP 请求拿网页
+# beautifulsoup4：解析 HTML，提取正文
+requests
+beautifulsoup4
