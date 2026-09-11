@@ -10,8 +10,15 @@
 并把环境变量映射成类的字段，同时还能做类型校验。
 """
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# 项目根目录（config.py 位于 src/ 下，它的上一级就是项目根目录）
+# 用 __file__ 定位而不是写死路径，保证无论从哪个目录启动都能找到 .env
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / ".env"
 
 
 class Settings(BaseSettings):
@@ -25,7 +32,7 @@ class Settings(BaseSettings):
 
     # 告诉 pydantic-settings 去哪里读配置、怎么读
     model_config = SettingsConfigDict(
-        env_file=".env",           # 从项目根目录的 .env 读取
+        env_file=ENV_FILE,         # 用绝对路径定位 .env，不依赖"当前工作目录"
         env_file_encoding="utf-8", # 用 UTF-8 编码读（避免中文注释乱码）
         extra="ignore",            # .env 里多出的字段直接忽略，不报错
     )
@@ -41,6 +48,15 @@ class Settings(BaseSettings):
 
     # ---- Agent 行为配置 ----
     max_iterations: int = 10   # 最大循环次数，防止 Agent 陷入死循环
+
+    # ---- 搜索与抓取配置（步骤 5）----
+    # Tavily 是专为 LLM Agent 设计的搜索 API，免费额度 1000 次/月
+    # 在 https://tavily.com 注册后即可拿到 Key
+    tavily_api_key: str = ""                      # Tavily 搜索 Key（为空则退化为 LLM 模拟搜索）
+    search_max_results: int = 5                   # 每次搜索最多取几条结果
+    fetch_top_n: int = 2                          # 每次搜索后，抓取前 N 条的网页正文（太多会拖慢速度、撑爆上下文）
+    fetch_timeout: int = 10                       # 单个网页抓取超时（秒）
+    fetch_max_chars: int = 1500                   # 单个网页正文最多截取多少字符（防上下文爆炸）
 
     # ---- 日志配置 ----
     log_level: str = "INFO"    # 日志级别：DEBUG / INFO / WARNING / ERROR

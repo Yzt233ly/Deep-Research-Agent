@@ -6,8 +6,10 @@ LLM 调用封装模块（步骤 2）
   2. 自动重试：网络抖动、限流等临时错误会自动重试，避免程序一抖就崩
   3. 成本统计：每次调用记录输入/输出 token 和费用，心里有数
 """
+import json
 from typing import TypeVar
 
+from json_repair import repair_json
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
@@ -182,14 +184,32 @@ class LLMClient:
             return parsed
 
         # 兜底：DeepSeek 在带 system message 时，LangChain 的自动解析会得到 None
-        # （parsing_error 也为 None，即"静默失败"）。但 raw.tool_calls 里其实有完整的
-        # 函数参数 args，手动用 schema.model_validate 解析更稳健。
+        # （parsing_error 也为 None，即"静默失败"）。此时数据可能藏在两类字段里：
+        #   - raw.tool_calls：JSON 合法时放这里（args 是 dict）
+        #   - raw.invalid_tool_calls：JSON 损坏时放这里（args 是字符串）
+        # DeepSeek 偶尔会在中文内容里输出"未转义的英文引号"，导致 JSON 解析失败，
+        # LangChain 就会把这类调用归类为 invalid_tool_calls。所以要同时检查两者。
         if raw is not None:
-            tool_calls = getattr(raw, "tool_calls", None) or []
-            for tc in tool_calls:
+            # 把两类 tool_calls 合并到一起遍历，避免漏掉 invalid_tool_calls
+            calls = (getattr(raw, "tool_calls", None) or []) + (
+                getattr(raw, "invalid_tool_calls", None) or []
+            )
+            for tc in calls:
                 args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
-                if args:
+                if not args:
+                    continue
+                # 情况一：args 已经是 dict（正常情况），直接校验
+                if isinstance(args, dict):
                     return schema.model_validate(args)
+                # 情况二：args 是字符串（可能损坏），先直接解析，失败再用 json_repair 修复
+                if isinstance(args, str):
+                    try:
+                        return schema.model_validate(json.loads(args))
+                    except Exception:
+                        try:
+                            return schema.model_validate(json.loads(repair_json(args)))
+                        except Exception:
+                            continue
 
         raise ValueError(f"结构化输出解析失败：{result.get('parsing_error')}")
 
