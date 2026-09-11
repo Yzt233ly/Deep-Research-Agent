@@ -101,14 +101,39 @@ class ResearchAgent:
             "report": 报告正文（with_report=False 时不含此键）,
           }
         """
+        # 命令行仍然可以一键研究；网页则分别调用下面两个接口，
+        # 在两次调用之间等待人确认，而不是用阻塞的 input() 等待。
+        return self.research_from_plan(topic, self.make_plan(topic), with_report)
+
+    def make_plan(self, topic: str) -> ResearchPlan:
+        """只调用规划模型，不搜索、不抓取，也不生成报告。"""
+        if not topic.strip():
+            raise ValueError("研究主题不能为空")
+        return self._make_plan(topic.strip())
+
+    def research_from_plan(
+        self, topic: str, plan: ResearchPlan, with_report: bool = True
+    ) -> dict:
+        """执行人工确认的计划，不再让模型重新规划覆盖人的修改。"""
+        if not topic.strip():
+            raise ValueError("研究主题不能为空")
+        if not plan.sub_questions:
+            raise ValueError("请至少保留一个子问题")
+        for sq in plan.sub_questions:
+            if not sq.question.strip():
+                raise ValueError("子问题不能为空")
+            if not 1 <= sq.priority <= 5:
+                raise ValueError("优先级必须是 1 到 5 的整数")
+        # 深拷贝避免排序或规范化时修改页面正在编辑的对象。
+        # 同优先级保留表格顺序（Python 的排序是稳定排序）。
+        plan = plan.model_copy(deep=True)
+        plan.sub_questions.sort(key=lambda sq: sq.priority, reverse=True)
+        topic = topic.strip()
         logger.info("========== 研究开始：%s ==========", topic)
         logger.info("搜索模式：%s", type(self.search_tool).__name__)
 
         # 每次研究前重置来源登记处，保证编号从 [1] 重新开始
         self.registry = SourceRegistry()
-
-        # 第一步：规划（Planning）—— 把大主题拆成子问题
-        plan = self._make_plan(topic)
 
         # 第二步：任务分解 + 逐个执行（Task Decomposition）
         answers: list[tuple[str, str]] = []
@@ -116,7 +141,9 @@ class ResearchAgent:
         total = len(plan.sub_questions)
         for i, sq in enumerate(plan.sub_questions, 1):
             logger.info("---------- 子问题 %d/%d：%s ----------", i, total, sq.question)
-            answer, notes = self._run_react(sq.question)
+            # 把人工编辑的整体思路交给执行阶段，避免只在页面显示却不生效。
+            context = f"{sq.question}\n整体研究思路：{plan.overall_approach}"
+            answer, notes = self._run_react(context)
             answers.append((sq.question, answer))
             all_notes.extend(notes)
 
@@ -132,7 +159,7 @@ class ResearchAgent:
 
         # 第三步：汇总成带引用的报告（步骤 5 新增）
         if with_report:
-            result["report"] = self._write_report(topic, answers)
+            result["report"] = self._write_report(topic, answers, plan.overall_approach)
 
         return result
 
@@ -206,7 +233,7 @@ class ResearchAgent:
             logger.info("  [第 %d 步] Action: search(%s)", step, query)
 
             observation, new_notes = self._web_search(query)
-            logger.info("  [第 %d 步] Observation: %s", step, observation)
+            logger.info("  [第 %d 步] Observation:\n%s", step, observation)
 
             local_notes.extend(new_notes)
             # 把这次观察结果记下来，供下一轮 LLM 参考（这就是"上下文记忆"）
@@ -328,7 +355,9 @@ class ResearchAgent:
 
     # ==================== 内部方法：报告生成（步骤 5）====================
 
-    def _write_report(self, topic: str, answers: list[tuple[str, str]]) -> str:
+    def _write_report(
+        self, topic: str, answers: list[tuple[str, str]], overall_approach: str = ""
+    ) -> str:
         """
         把所有子问题的答案汇总成一份完整的研究报告。
 
@@ -352,6 +381,7 @@ class ResearchAgent:
 
         prompt = (
             f"研究主题：{topic}\n\n"
+            f"整体研究思路：{overall_approach}\n\n"
             f"以下是各子问题的研究结论：\n{answer_lines}\n\n"
             f"以下是本次研究可引用的来源清单（编号已经固定，不要新增或改动）：\n{source_lines}\n\n"
             f"请基于以上材料写一份结构化的研究报告，要求：\n"

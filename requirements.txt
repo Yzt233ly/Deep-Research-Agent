@@ -37,3 +37,6 @@ beautifulsoup4
 # pytest：Python 最主流的测试框架
 # 说明：测试用 Mock 模拟 LLM，不需要真实 API Key，因此不会产生费用
 pytest
+
+# 网页前端与人工计划确认（使用 data_editor、session_state 与 AppTest）
+streamlit>=1.63,<2
