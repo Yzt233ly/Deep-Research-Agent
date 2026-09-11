@@ -32,3 +32,8 @@ json-repair
 tavily-python
 requests
 beautifulsoup4
+
+# --- 步骤 6：单元测试 ---
+# pytest：Python 最主流的测试框架
+# 说明：测试用 Mock 模拟 LLM，不需要真实 API Key，因此不会产生费用
+pytest

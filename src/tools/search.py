@@ -29,12 +29,15 @@ class WebSearchTool:
     def __init__(self, api_key: str | None = None, max_results: int | None = None) -> None:
         """
         参数：
-          api_key: Tavily Key；不传则从配置（.env）里读
+          api_key: Tavily Key；不传（None）则从配置（.env）里读
           max_results: 每次搜索最多返回几条结果；不传则从配置里读
         """
         settings = get_settings()
-        self.api_key = api_key or settings.tavily_api_key
-        self.max_results = max_results or settings.search_max_results
+        # 注意用 `is not None` 而不是 `or`：
+        #   显式传入空字符串 "" 时，应该判定为"没有 Key"并报错，
+        #   而不是悄悄回退去读 .env 里的 Key（否则测试无法确定性验证）。
+        self.api_key = api_key if api_key is not None else settings.tavily_api_key
+        self.max_results = max_results if max_results is not None else settings.search_max_results
 
         if not self.api_key:
             # 没有 Key 时直接报错，让调用方知道"真实搜索不可用"

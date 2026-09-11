@@ -1,8 +1,8 @@
 """
-ReAct 循环核心模块（步骤 4 + 步骤 5）
+ReAct 循环核心模块（步骤 4 + 步骤 5 + 步骤 6）
 
 ReAct = Reasoning（思考）+ Acting（行动）
-循环结构：Thought → Action → Observation →（重复，直到 finish）
+循环结构：Thought → Action → Observation → 反思 →（重复，直到 finish）
 
 这个模块实现 ResearchAgent，是 Agent 的"大脑"：
   1. 制定研究计划（Planning）：把大主题拆成子问题（步骤 3 的 ResearchPlan）
@@ -11,16 +11,20 @@ ReAct = Reasoning（思考）+ Acting（行动）
      - Thought：让 LLM 思考下一步做什么
      - Action：LLM 决定"继续搜索"还是"结束"
      - Observation：执行动作后的观察结果
-  4. 循环直到 LLM 说"finish"，或达到最大循环次数（防止死循环）
+     - 反思（步骤 6）：自问"资料够了没"，够了就提前收尾
+  4. 循环直到 LLM 说"finish"、反思认为够了、或达到最大循环次数
   5. 汇总所有子问题的答案，生成带 [n] 引用编号的研究报告（步骤 5）
 
-步骤 5 相比步骤 4 的关键变化：
-  步骤 4：_mock_search() —— 让 LLM"假装"搜索，结果不可信，只为理解循环机制
-  步骤 5：_web_search()  —— 调用真实搜索（Tavily）+ 抓取网页正文，结果可溯源
+三个步骤的演进关系：
+  步骤 4：_mock_search()  —— LLM"假装"搜索，只为理解循环机制
+  步骤 5：_web_search()    —— 真实搜索 + 抓取网页正文，结果可溯源
+  步骤 6：在 _web_search 里加了【去重】和【压缩】，并新增【反思】环节
 """
+from src.agent.compressor import ContextCompressor
+from src.agent.reflector import Reflector
 from src.config import get_settings
 from src.llm.client import LLMClient
-from src.models import AgentAction, ResearchPlan
+from src.models import AgentAction, ResearchNote, ResearchPlan
 from src.tools import MockSearchTool, SourceRegistry, WebFetcher, WebSearchTool
 from src.utils.logger import get_logger
 
@@ -44,7 +48,7 @@ REPORT_SYSTEM_PROMPT = (
 
 
 class ResearchAgent:
-    """研究型 Agent：制定计划，对每个子问题执行 ReAct 循环，最后汇总成带引用的报告。"""
+    """研究型 Agent：制定计划，对每个子问题执行 ReAct 循环（含反思），最后汇总成带引用的报告。"""
 
     def __init__(
         self,
@@ -66,11 +70,15 @@ class ResearchAgent:
         # 搜索工具：默认自动选择。显式传入则用传入的（方便测试或强制用模拟搜索）
         self.search_tool = search_tool or self._default_search_tool()
 
-        # 抓取工具：用来获取网页正文（注意 fetcher 是可选依赖，允许传 None 表示不抓取）
+        # 抓取工具：用来获取网页正文（fetcher 允许为 None，表示不抓取）
         self.fetcher = fetcher if fetcher is not None else WebFetcher()
 
+        # 步骤 6 新增的两个"加工厂"：压缩器 + 反思器
+        # 它们也依赖 LLM，所以把同一个 self.llm 注入进去
+        self.compressor = ContextCompressor(self.llm)
+        self.reflector = Reflector(self.llm)
+
         # 引用登记处：记录本次研究用到的所有来源，负责编号与去重
-        # 每次 research() 开始时会重置，避免多次研究之间互相污染
         self.registry = SourceRegistry()
 
     # ==================== 对外主流程 ====================
@@ -88,6 +96,7 @@ class ResearchAgent:
             "topic": 主题,
             "plan": ResearchPlan 对象,
             "answers": [(子问题, 答案), ...],
+            "notes": [ResearchNote, ...],     # 全程收集到的关键事实（步骤 6）
             "sources": [Citation, ...],       # 本次研究引用到的所有来源
             "report": 报告正文（with_report=False 时不含此键）,
           }
@@ -103,11 +112,13 @@ class ResearchAgent:
 
         # 第二步：任务分解 + 逐个执行（Task Decomposition）
         answers: list[tuple[str, str]] = []
+        all_notes: list[ResearchNote] = []
         total = len(plan.sub_questions)
         for i, sq in enumerate(plan.sub_questions, 1):
             logger.info("---------- 子问题 %d/%d：%s ----------", i, total, sq.question)
-            answer = self._run_react(sq.question)
+            answer, notes = self._run_react(sq.question)
             answers.append((sq.question, answer))
+            all_notes.extend(notes)
 
         logger.info("========== 所有子问题已回答完毕，共 %d 个 ==========", len(answers))
 
@@ -115,6 +126,7 @@ class ResearchAgent:
             "topic": topic,
             "plan": plan,
             "answers": answers,
+            "notes": all_notes,
             "sources": self.registry.items(),
         }
 
@@ -154,20 +166,25 @@ class ResearchAgent:
         logger.info("计划生成成功，共拆解出 %d 个子问题", len(plan.sub_questions))
         return plan
 
-    def _run_react(self, question: str) -> str:
+    def _run_react(self, question: str) -> tuple[str, list[ResearchNote]]:
         """
-        对单个子问题执行 ReAct 循环，返回最终答案。
+        对单个子问题执行 ReAct 循环。
+
+        返回：
+          (答案, 本子问题收集到的关键事实列表)
 
         循环逻辑：
           每一轮：
             1. 让 LLM 输出 Thought + Action
             2. 如果 action == "finish"：返回 answer，循环结束
-            3. 如果 action == "search"：真实搜索 + 抓取，得到 Observation
-            4. 把 Observation 追加到上下文，进入下一轮
-          直到 LLM 说 finish，或达到最大循环次数（兜底强制收尾）
+            3. 如果 action == "search"：真实搜索 + 抓取 + 去重 + 压缩，得到 Observation
+            4. 反思：判断"资料够不够"；够了就提前收尾（步骤 6）
+            5. 把 Observation 与反思建议追加到上下文，进入下一轮
         """
         # 用列表记录每一步的观察结果，作为下一轮 LLM 的"上下文/记忆"
         observations: list[str] = []
+        # 本子问题收集到的关键事实（只属于当前子问题，用于反思判断）
+        local_notes: list[ResearchNote] = []
 
         for step in range(1, self.max_iterations + 1):
             # 构造 prompt：把子问题 + 已观察到的信息一起喂给 LLM
@@ -182,21 +199,43 @@ class ResearchAgent:
             # 根据 action 分支处理 —— 这就是 ReAct 里的 Acting
             if action.action == "finish":
                 logger.info("  [第 %d 步] Action: finish（信息已足够，结束）", step)
-                return action.answer or ""
+                return action.answer or "", local_notes
 
-            # action == "search"：真实搜索 + 抓取网页正文，得到观察结果
+            # action == "search"：真实搜索 + 抓取 + 去重 + 压缩
             query = action.search_query or question
             logger.info("  [第 %d 步] Action: search(%s)", step, query)
 
-            observation = self._web_search(query)
+            observation, new_notes = self._web_search(query)
             logger.info("  [第 %d 步] Observation: %s", step, observation)
 
+            local_notes.extend(new_notes)
             # 把这次观察结果记下来，供下一轮 LLM 参考（这就是"上下文记忆"）
             observations.append(f"搜索「{query}」的结果：\n{observation}")
 
-        # 走到这里说明达到最大循环次数仍没 finish，强制收尾
+            # ---------- 步骤 6 新增：反思 ----------
+            # 让 Agent 显式地"自我评估"：现有资料够不够回答这个子问题？
+            reflection = self.reflector.reflect(question, local_notes)
+            logger.info(
+                "  [第 %d 步] 反思：%s（%s）",
+                step,
+                "资料已足够" if reflection.is_sufficient else "资料仍不足",
+                reflection.reason,
+            )
+
+            if reflection.is_sufficient:
+                # 资料够了就提前结束，不必搜到循环上限 —— 这是反思最大的价值：省时省钱
+                logger.info("  [第 %d 步] 反思判定资料足够，提前结束搜索", step)
+                return self._answer_from_notes(question, local_notes), local_notes
+
+            # 资料不足：把"缺什么、建议搜什么"带进下一轮，帮助 LLM 做出更好的决策
+            advice = f"（自评：资料仍不足——{reflection.missing}）"
+            if reflection.suggested_query:
+                advice += f" 建议下一步搜索：{reflection.suggested_query}"
+            observations.append(advice)
+
+        # 走到这里说明达到最大循环次数仍未结束，强制收尾
         logger.warning("  ⚠ 达到最大循环次数 %d，强制生成答案", self.max_iterations)
-        return self._force_answer(question, observations)
+        return self._force_answer(question, observations), local_notes
 
     def _build_react_prompt(self, question: str, observations: list[str]) -> str:
         """构造每轮 ReAct 的 prompt：子问题 + 已有的观察信息。"""
@@ -212,40 +251,72 @@ class ResearchAgent:
             f"请决定下一步：信息不够就 search，信息足够就 finish 并给出答案。"
         )
 
-    # ==================== 内部方法：搜索与抓取（步骤 5 核心）====================
+    # ==================== 内部方法：搜索、去重与压缩（步骤 5 + 步骤 6）====================
 
-    def _web_search(self, query: str) -> str:
+    def _web_search(self, query: str) -> tuple[str, list[ResearchNote]]:
         """
-        执行一次"真实搜索 + 网页抓取"，返回给 LLM 看的 Observation 文本。
+        执行一次"真实搜索 → 去重 → 抓取 → 压缩"，返回 Observation 文本与关键事实。
 
-        流程：
-          1. 调用搜索工具，拿到若干条结果（Citation）
-          2. 每条结果到引用登记处登记，拿到一个 [n] 编号
-          3. 对前 fetch_top_n 条结果，抓取网页正文（信息更完整）
-          4. 把结果拼成一段文字作为 Observation 返回
+        和步骤 5 的区别（步骤 6 新增的两处）：
+          1. 去重：登记过的来源直接跳过，不再抓取、不再压缩（省时省钱）
+          2. 压缩：抓到的正文先提炼成 3~5 条关键事实，只把"事实"放进 prompt，
+             而不是把整段正文塞进去（控制上下文长度）
 
-        返回的文本里带 [n] 编号，这样 LLM 在写答案时就能"顺手"引用编号，
-        最终报告里的 [n] 也就能和文末参考文献对应上。
+        返回：
+          (给 LLM 看的 Observation 文本, 本轮提取到的关键事实列表)
         """
         citations = self.search_tool.search(query)
         if not citations:
-            return "（本次搜索没有返回结果）"
+            return "（本次搜索没有返回结果）", []
 
         parts: list[str] = []
+        notes_this_round: list[ResearchNote] = []
+
         for index, citation in enumerate(citations):
-            # 登记来源：同一个 URL 只会拿到同一个编号（去重）
+            # ---------- 去重 ----------
+            # 见过就跳过：省一次网页抓取、省一次压缩的 LLM 调用
+            if self.registry.is_seen(citation.url, citation.title):
+                logger.info("  [去重] 跳过已见过的来源：%s", citation.title)
+                continue
+
+            # 登记来源：拿到 [n] 编号（同一个 URL 只会拿到同一个编号）
             number = self.registry.add(citation)
 
+            # ---------- 获取原始资料 ----------
             # 默认用搜索摘要；对前 N 条尝试抓取正文，拿到更完整的内容
-            snippet = citation.summary
+            source_text = citation.summary
             if index < self.fetch_top_n and citation.url.startswith("http"):
                 full_text = self.fetcher.fetch(citation.url)
                 if full_text:
-                    snippet = full_text  # WebFetcher 内部已按 fetch_max_chars 截断
+                    source_text = full_text  # WebFetcher 内部已按 fetch_max_chars 截断
 
-            parts.append(f"[{number}] {citation.title}\n链接：{citation.url}\n内容：{snippet}")
+            # ---------- 压缩 ----------
+            # 把原始资料"读薄"成 3~5 条关键事实，避免整段正文进入后续 prompt
+            notes = self.compressor.compress(source_text, citation.url)
+            notes_this_round.extend(notes)
 
-        return "\n\n".join(parts)
+            if notes:
+                fact_lines = "\n".join(f"  - {note.fact}" for note in notes)
+                parts.append(f"[{number}] {citation.title}\n链接：{citation.url}\n关键事实：\n{fact_lines}")
+            else:
+                parts.append(f"[{number}] {citation.title}\n链接：{citation.url}\n（未能提取到有效内容）")
+
+        if not parts:
+            # 所有结果都被去重跳过了（说明这一轮搜索没带来新信息）
+            return "（本次搜索结果均已被去重跳过，没有新信息）", []
+
+        return "\n\n".join(parts), notes_this_round
+
+    def _answer_from_notes(self, question: str, notes: list[ResearchNote]) -> str:
+        """基于已收集的关键事实证明回答子问题（反思判定"资料已足够"时调用）。"""
+        if not notes:
+            return "（没有可用资料，无法回答）"
+
+        facts = "\n".join(f"- {note.fact}" for note in notes)
+        return self.llm.chat(
+            f"请只依据以下已核实的事实，回答子问题：\n{question}\n\n已核实的事实：\n{facts}",
+            system="你是一名严谨的研究助手，请严格依据给定事实作答，不要引入事实之外的内容。",
+        )
 
     def _force_answer(self, question: str, observations: list[str]) -> str:
         """循环超限时的兜底：直接让 LLM 基于已有信息给出答案。"""
@@ -255,7 +326,7 @@ class ResearchAgent:
             system="你是一名研究助手，请基于给定信息给出尽可能完整的回答。",
         )
 
-    # ==================== 内部方法：报告生成（步骤 5 核心）====================
+    # ==================== 内部方法：报告生成（步骤 5）====================
 
     def _write_report(self, topic: str, answers: list[tuple[str, str]]) -> str:
         """

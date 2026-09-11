@@ -73,3 +73,36 @@ class AgentAction(BaseModel):
     answer: str | None = Field(
         default=None, description="对该子问题的最终回答，仅当 action='finish' 时填写"
     )
+
+
+class ExtractedFacts(BaseModel):
+    """
+    从一篇资料中压缩提取出的关键事实（步骤 6 新增）。
+
+    为什么需要它？（这就是"上下文压缩"）
+      一篇网页正文可能有几千字，如果每轮都把它整段塞进 prompt，
+      上下文会越来越长，导致：变慢、变贵、模型抓不住重点。
+      所以先让 LLM 把正文"读薄"成 3~5 条关键事实，只保留事实，丢掉废话。
+
+    注意字段类型是 list[str]（纯字符串），不是 list[ResearchNote]。
+    原因：source_url 由程序在压缩后补充，不让 LLM 填写，
+      避免 LLM 篡改或编造链接（和步骤 5 的教训一致：真实性交给程序保证）。
+    """
+    facts: list[str] = Field(description="从资料中提取出的 3~5 条关键事实，每条一句话")
+
+
+class ReflectionResult(BaseModel):
+    """
+    反思结果：Agent 对自己"资料够不够"的自我评估（步骤 6 新增）。
+
+    这就是 Reflection（反思）模式：
+      普通 Agent 只会"一直搜到循环次数上限"或者"LLM 自己说够了"。
+      加了反思后，Agent 会显式地自问："现有资料能回答子问题了吗？还缺什么？"
+      从而更早停止、或在资料不足时给出更精准的下一步搜索词。
+    """
+    is_sufficient: bool = Field(description="现有资料是否已足以回答子问题")
+    reason: str = Field(description="做出该判断的一句话理由")
+    missing: str = Field(description="若资料不足，说明还缺少什么信息；若已足够，填「无」")
+    suggested_query: str | None = Field(
+        default=None, description="若资料不足，建议下一步使用的搜索关键词"
+    )
