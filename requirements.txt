@@ -40,3 +40,6 @@ pytest
 
 # 网页前端与人工计划确认（使用 data_editor、session_state 与 AppTest）
 streamlit>=1.63,<2
+
+# LangGraph 学习：使用当前环境中实际验证过的版本
+langgraph==1.2.11
